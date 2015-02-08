@@ -14,6 +14,9 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"strconv"
+
+	"github.com/davecheney/profile"
 )
 
 const version = "0.2.5"
@@ -23,6 +26,12 @@ type grepInfo struct {
 	lineNumber int
 	line       string
 }
+
+type writerInfo struct {
+	fpath      string
+	output     string
+}
+
 
 type channelSet struct {
 	dir     chan string
@@ -39,6 +48,7 @@ type optionSet struct {
 	ignore        string
 	hidden        bool
 	ignorecase    bool
+	nocolor       bool
 }
 
 type searchScope struct {
@@ -57,6 +67,7 @@ type gorep struct {
 }
 
 var semFopenLimit chan int
+var nocolor bool
 
 const maxNumOfFileOpen = 10
 
@@ -83,6 +94,7 @@ The options are:
     -ignore pattern : pattern is ignored
     -hidden         : search hidden files
     -ignorecase     : ignore case distinctions in pattern
+    -nocolor        : don't use color in the output
 `, version)
 	os.Exit(-1)
 }
@@ -94,11 +106,15 @@ func init() {
 func verifyColor() bool {
 	fd := os.Stdout.Fd()
 	isTerm := terminal.IsTerminal(int(fd))
-	return isTerm
+	return isTerm && !nocolor
 }
 
 func main() {
 	runtime.GOMAXPROCS(runtime.NumCPU())
+
+	if false{
+		  defer profile.Start(profile.CPUProfile).Stop()
+	}
 
 	var opt optionSet
 	flag.BoolVar(&opt.v, "V", false, "show version.")
@@ -108,7 +124,10 @@ func main() {
 	flag.StringVar(&opt.ignore, "ignore", "", "pattern is ignored.")
 	flag.BoolVar(&opt.hidden, "hidden", false, "search hidden files.")
 	flag.BoolVar(&opt.ignorecase, "ignorecase", false, "ignore case distinctions in pattern.")
+	flag.BoolVar(&opt.nocolor, "nocolor", false, "do not use color output.")
 	flag.Parse()
+
+	nocolor = opt.nocolor
 
 	if opt.v {
 		fmt.Printf("version: %s\n", version)
@@ -158,7 +177,7 @@ func (this *gorep) report(chans *channelSet, isColor bool) {
 		markDir = "[Dir ]"
 		markFile = "[File]"
 		markSymlink = "[SymL]"
-		markGrep = "[Grep]"
+		markGrep = ""
 	}
 
 	var waitReports sync.WaitGroup
@@ -168,6 +187,34 @@ func (this *gorep) report(chans *channelSet, isColor bool) {
 	go func() {
 		for {
 			os.Stdout.Write(<-chPrint)
+		}
+	}()
+
+	chWriter := make(chan writerInfo)
+
+	// writer
+	go func() {
+		current_path := "dinges"
+		var writer *bufio.Writer
+		for {
+			result,ok := <-chWriter
+			if( !ok ){
+				fmt.Fprintf(os.Stderr, "writer goroutine is done\n")
+				return
+			}
+			if( result.fpath != current_path ) {
+				current_path = result.fpath
+				fmt.Fprintf(os.Stderr, "switch to file %s\n", current_path)
+				file, err := os.Create(result.fpath)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "%v\n", err)
+					os.Exit(-1)
+				}
+				defer file.Close()
+				writer = bufio.NewWriter(file)
+				defer writer.Flush()
+			}
+			writer.WriteString(result.output)
 		}
 	}()
 
@@ -182,8 +229,11 @@ func (this *gorep) report(chans *channelSet, isColor bool) {
 		case chan grepInfo:
 			for msg := range ch {
 				if msg.lineNumber != 0 {
-					decoStr := this.pattern.ReplaceAllString(msg.line, accent)
-					chPrint <- []byte(fmt.Sprintf("%s %s:%d: %s\n", mark, msg.fpath, msg.lineNumber, decoStr))
+					// no need for this decoStr := this.pattern.ReplaceAllString(msg.line, accent)
+					decoStr := msg.line
+					output := fmt.Sprintf("%s %s:%d: %s\n", mark, msg.fpath, msg.lineNumber, decoStr)
+					// NDC chPrint <- []byte(output)
+					chWriter<- writerInfo{ msg.fpath, output}
 				} else { // binary file
 					chPrint <- []byte(fmt.Sprintf("%s %s\n", mark, msg.line))
 				}
@@ -199,6 +249,7 @@ func (this *gorep) report(chans *channelSet, isColor bool) {
 	go reporter(markSymlink, markMatch, chans.symlink)
 	go reporter(markGrep, markMatch, chans.grep)
 	waitReports.Wait()
+	close(chWriter)
 }
 
 func newGorep(pattern string, opt *optionSet) *gorep {
@@ -242,6 +293,7 @@ func newGorep(pattern string, opt *optionSet) *gorep {
 	if opt.g {
 		base.scope.grep = true
 	}
+
 	if opt.grep_only {
 		base.scope.dir = false
 		base.scope.file = false
@@ -431,19 +483,37 @@ func (this *gorep) grep(fpath string, out chan<- grepInfo) {
 
 	scanner.Split(bufio.ScanLines)
 	lineNumber := 0
+	bootNumber := 0
+	writeFilePath := "invalidfile"
+	boot_pattern := regexp.MustCompile("(Boot-)|(Wakeup now!!)")
+	// if err != nil {
+	// 	fmt.Fprintf(os.Stderr, "%v\n", err)
+	// 	os.Exit(-1)
+	// }
+
+    // get rid of unused warning :-(
+	if boot_pattern.MatchString("dinges") {
+		boot_pattern = nil
+	}
 
 	for scanner.Scan() {
 		lineNumber++
-		strline := scanner.Text()
-		if this.pattern.MatchString(strline) {
+		strbuf := scanner.Bytes()
+		if lineNumber == 1  || boot_pattern.Match(strbuf) {
+			bootNumber++
+			writeFilePath = fpath + "_" + strconv.Itoa(bootNumber)
+		}
+
+		if this.pattern.Match(strbuf) {
 			if isBinary {
-				out <- grepInfo{fpath, 0, fmt.Sprintf("Binary file %s matches", fpath)}
+				out <- grepInfo{writeFilePath, 0, fmt.Sprintf("Binary file %s matches", fpath)}
 				return
 			} else {
+				strline := string(strbuf)
 				if this.ignorePattern != nil && this.ignorePattern.MatchString(strline) {
 					continue
 				}
-				out <- grepInfo{fpath, lineNumber, strline}
+				out <- grepInfo{writeFilePath, lineNumber, strline}
 			}
 		}
 	}
